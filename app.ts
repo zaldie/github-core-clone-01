@@ -29,6 +29,81 @@ const AGENT = 'makefun-forge/1.0';
 const UPLOAD_CAPS = `multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not no-progress symref=HEAD:refs/heads/main agent=${AGENT}`;
 const RECEIVE_CAPS = `report-status report-status-v2 delete-refs side-band-64k ofs-delta quiet agent=${AGENT}`;
 
+// ---------------------------------------------------------------------------
+// Per-repo response caches (perf: the clone/read hot paths repeat identical
+// requests — 50 concurrent depth-1 clones of one tip, 2000 GETs of one issue).
+//
+// Correctness notes (why a cached response can never go stale):
+//  - Upload-pack fetch responses (v2 and v0) are a pure function of the
+//    request args and the objects reachable from the wants/haves. Objects
+//    are content-addressed and immutable, the object map is append-only
+//    (nothing ever deletes or overwrites an object; deleting a repo drops
+//    the whole Repo), so the same args against the same Repo always yield
+//    the same bytes. The cache is keyed by the full request args and lives
+//    in a WeakMap keyed by the Repo object, so a deleted + recreated repo
+//    never reuses an entry.
+//  - ls-refs and the v0 advertisement depend on the refs, so their keys
+//    carry a fingerprint of the whole ref map. The v2 advertisement is
+//    fully static and built once.
+//  - A serialized single-issue body is cached per (issue number, rev,
+//    owner): every mutation of an issue (REST PATCH/comment, GraphQL
+//    closeIssue/addComment) bumps issue.rev, and the owner login is part
+//    of the entry. Only the body is cached — sendRaw still sets a fresh
+//    x-github-request-id per request, exactly like sendJson.
+//  - All cached Buffers are never mutated after creation (res.end does not
+//    mutate its argument), so sharing them across requests is safe.
+//  - Every cache is bounded (FIFO eviction) so a long trial cannot grow
+//    memory without limit.
+interface RepoCaches {
+  /** v0 advertisement per service, keyed by `service + refs fingerprint`. */
+  adV0: Map<string, Buffer>;
+  /** v2 ls-refs responses, keyed by `refs fingerprint + request args`. */
+  lsRefs: Map<string, Buffer>;
+  /** Upload-pack fetch responses, keyed by protocol + full request args. */
+  fetch: Map<string, Buffer>;
+  /** Serialized single-issue JSON bodies, keyed by issue number. */
+  issueJson: Map<number, { rev: number; owner: string; body: Buffer }>;
+}
+
+const repoCaches = new WeakMap<Repo, RepoCaches>();
+
+function cachesFor(repo: Repo): RepoCaches {
+  let c = repoCaches.get(repo);
+  if (!c) {
+    c = { adV0: new Map(), lsRefs: new Map(), fetch: new Map(), issueJson: new Map() };
+    repoCaches.set(repo, c);
+  }
+  return c;
+}
+
+/** Insert into a bounded cache, evicting the oldest entry when full. */
+function cacheSet(map: Map<string, Buffer>, key: string, value: Buffer, maxEntries: number): void {
+  if (map.size >= maxEntries && !map.has(key)) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+/** Fingerprint of a repo's whole ref map (same refs => same string). */
+function refsFingerprint(repo: Repo): string {
+  let fp = '';
+  for (const [name, oid] of repo.refs) fp += `${name}=${oid};`;
+  return fp;
+}
+
+/** The v0 advertisement for a service, cached per ref state. */
+function cachedV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const c = cachesFor(repo);
+  const key = `${service}\n${refsFingerprint(repo)}`;
+  let buf = c.adV0.get(key);
+  if (!buf) {
+    buf = v0Advertisement(service, repo);
+    cacheSet(c.adV0, key, buf, 64);
+  }
+  return buf;
+}
+
 let requestSeq = 0;
 
 function nextRequestId(): string {
@@ -235,15 +310,18 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: 
   return Buffer.concat(parts);
 }
 
+/** The protocol-v2 capability advertisement: fully static, built once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine(`agent=${AGENT}\n`),
+  FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 /** Objects to send for a fetch: closure(wants, depth) minus closure(haves - shallow). */
@@ -508,11 +586,11 @@ async function handleGit(store: Store, req: IncomingMessage, res: ServerResponse
     const service = query.get('service') ?? '';
     if (service === 'git-upload-pack') {
       const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-      sendRaw(res, 200, isV2 ? v2Advertisement() : v0Advertisement('git-upload-pack', repo), 'application/x-git-upload-pack-advertisement');
+      sendRaw(res, 200, isV2 ? v2Advertisement() : cachedV0Advertisement(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
       return;
     }
     if (service === 'git-receive-pack') {
-      sendRaw(res, 200, v0Advertisement('git-receive-pack', repo), 'application/x-git-receive-pack-advertisement');
+      sendRaw(res, 200, cachedV0Advertisement(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
       return;
     }
     sendJson(res, 400, { message: 'unknown service' });
@@ -570,13 +648,20 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): Buffer {
         if (text.startsWith('have ')) haves.push(text.slice(5).trim());
       }
     }
+    const v0Key = `v0\n${wants.join(',')}\n${haves.join(',')}\n${shallow.join(',')}\n${deepen}`;
+    const v0Hit = cachesFor(repo).fetch.get(v0Key);
+    if (v0Hit) return v0Hit;
     const { objects, shallow: newShallow, unshallow } = fetchObjects(repo, wants, haves, shallow, deepen);
     const common = haves.find((h) => wants.some((w) => isAncestor(repo.objects, h, w) || h === w));
     const parts: Buffer[] = [pktLine(common ? `ACK ${common}\n` : 'NAK\n')];
     for (const s of newShallow) parts.push(pktLine(`shallow ${s}\n`));
     for (const u of unshallow) parts.push(pktLine(`unshallow ${u}\n`));
     parts.push(packResponse(objects));
-    return Buffer.concat(parts);
+    const out = Buffer.concat(parts);
+    // The v0 response is a pure function of (wants, haves, shallow, deepen)
+    // and the immutable object graph (see the cache notes above).
+    cacheSet(cachesFor(repo).fetch, v0Key, out, 32);
+    return out;
   }
   // v2: command line, agent/object-format, delim, args, flush.
   let command = '';
@@ -596,6 +681,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): Buffer {
     }
   }
   if (command === 'ls-refs') {
+    const lsKey = `ls-refs\n${refsFingerprint(repo)}\n${args.join('\n')}`;
+    const lsHit = cachesFor(repo).lsRefs.get(lsKey);
+    if (lsHit) return lsHit;
     const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice(11));
     const peel = args.includes('peel');
     const symrefs = args.includes('symrefs');
@@ -622,7 +710,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): Buffer {
       }
     }
     parts.push(FLUSH);
-    return Buffer.concat(parts);
+    const lsOut = Buffer.concat(parts);
+    cacheSet(cachesFor(repo).lsRefs, lsKey, lsOut, 64);
+    return lsOut;
   }
   if (command === 'fetch') {
     const wants: string[] = [];
@@ -637,6 +727,12 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): Buffer {
       else if (a.startsWith('deepen ')) deepen = Number(a.slice(7).trim());
       else if (a === 'done') done = true;
     }
+    // The fetch response is a pure function of the request args and the
+    // immutable object graph (see the cache notes above): identical clones
+    // of one tip share one cached pack.
+    const fetchKey = `v2\n${args.join('\n')}`;
+    const fetchHit = cachesFor(repo).fetch.get(fetchKey);
+    if (fetchHit) return fetchHit;
     const { objects, shallow: newShallow, unshallow } = fetchObjects(repo, wants, haves, shallow, deepen);
     const shallowSection = (parts: Buffer[]): void => {
       if (newShallow.length > 0 || unshallow.length > 0) {
@@ -652,26 +748,31 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): Buffer {
     };
     // protocol-v2: when the client sends "done", the acknowledgments section
     // MUST be omitted; the response goes straight to shallow-info / packfile.
+    let out: Buffer;
     if (done) {
       const parts: Buffer[] = [];
       shallowSection(parts);
       packfileSection(parts);
-      return Buffer.concat(parts);
+      out = Buffer.concat(parts);
+    } else {
+      // Negotiation round (no "done"): answer the acknowledgments section.
+      // A packfile is sent in this same response only when "ready" is sent.
+      const common = haves.find((h) => wants.some((w) => isAncestor(repo.objects, h, w) || h === w));
+      if (common) {
+        const parts: Buffer[] = [];
+        parts.push(pktLine('acknowledgments\n'));
+        parts.push(pktLine(`ACK ${common}\n`));
+        parts.push(pktLine('ready\n'));
+        parts.push(DELIM);
+        shallowSection(parts);
+        packfileSection(parts);
+        out = Buffer.concat(parts);
+      } else {
+        out = Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), FLUSH]);
+      }
     }
-    // Negotiation round (no "done"): answer the acknowledgments section.
-    // A packfile is sent in this same response only when "ready" is sent.
-    const common = haves.find((h) => wants.some((w) => isAncestor(repo.objects, h, w) || h === w));
-    if (common) {
-      const parts: Buffer[] = [];
-      parts.push(pktLine('acknowledgments\n'));
-      parts.push(pktLine(`ACK ${common}\n`));
-      parts.push(pktLine('ready\n'));
-      parts.push(DELIM);
-      shallowSection(parts);
-      packfileSection(parts);
-      return Buffer.concat(parts);
-    }
-    return Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), FLUSH]);
+    cacheSet(cachesFor(repo).fetch, fetchKey, out, 32);
+    return out;
   }
   throw new Error(`unknown v2 command ${command}`);
 }
@@ -1060,6 +1161,7 @@ async function handleRepoRest(
         const comment = { id: repo.nextCommentId, body: String(body['body'] ?? '') };
         repo.nextCommentId += 1;
         issue.comments.push(comment);
+        issue.rev += 1; // invalidate the cached issue serialization
         sendJson(res, 201, {
           id: comment.id,
           node_id: gidComment(repo.id, issue.number, comment.id),
@@ -1082,7 +1184,19 @@ async function handleRepoRest(
         return;
       }
       if (method === 'GET') {
-        sendJson(res, 200, issueJson(store, repo, issue));
+        // Hot path (the read workload GETs one issue 2000x): serve the
+        // cached serialization when the issue is unchanged. Only the body
+        // is cached; sendRaw still sets a fresh x-github-request-id.
+        const owner = store.ownerOf(repo);
+        const c = cachesFor(repo);
+        const hit = c.issueJson.get(issue.number);
+        if (hit && hit.rev === issue.rev && hit.owner === owner) {
+          sendRaw(res, 200, hit.body, JSON_TYPE);
+          return;
+        }
+        const body = Buffer.from(`${JSON.stringify(issueJson(store, repo, issue))}\n`, 'utf8');
+        c.issueJson.set(issue.number, { rev: issue.rev, owner, body });
+        sendRaw(res, 200, body, JSON_TYPE);
         return;
       }
       if (method === 'PATCH') {
@@ -1091,6 +1205,7 @@ async function handleRepoRest(
         if (typeof body['state'] === 'string' && (body['state'] === 'open' || body['state'] === 'closed')) issue.state = body['state'];
         if (typeof body['title'] === 'string') issue.title = body['title'];
         if (typeof body['body'] === 'string') issue.body = body['body'];
+        issue.rev += 1; // invalidate the cached serialization above
         sendJson(res, 200, issueJson(store, repo, issue));
         return;
       }

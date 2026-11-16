@@ -19,17 +19,39 @@ import {
 
 export const FIXED_IDENTITY = 'Conformance User <conformance@example.com>';
 
+// The trial clock never moves inside one process: MAKEFUN_TRIAL_NOW is set
+// once per trial, so the values derived from it are cached at module level
+// (keyed on the raw env string, so a changed env still recomputes).
+// fixedIso()/fixedEpochSeconds() sit on the read/write hot paths (every
+// issue/repo serialization calls them), and Date.parse + toISOString per
+// call was measurable.
+let cachedEpochRaw: string | null = null;
+let cachedEpochSeconds = 0;
+
 export function fixedEpochSeconds(): number {
   const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
+  if (raw === cachedEpochRaw) return cachedEpochSeconds;
+  cachedEpochRaw = raw;
   if (raw !== '') {
     const ms = Date.parse(raw);
-    if (!Number.isNaN(ms)) return Math.floor(ms / 1000);
+    if (!Number.isNaN(ms)) {
+      cachedEpochSeconds = Math.floor(ms / 1000);
+      return cachedEpochSeconds;
+    }
   }
-  return 1735689600; // 2025-01-01T00:00:00Z
+  cachedEpochSeconds = 1735689600; // 2025-01-01T00:00:00Z
+  return cachedEpochSeconds;
 }
 
+let cachedIsoRaw: string | null = null;
+let cachedIso = '';
+
 export function fixedIso(): string {
-  return new Date(fixedEpochSeconds() * 1000).toISOString();
+  const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
+  if (raw === cachedIsoRaw) return cachedIso;
+  cachedIsoRaw = raw;
+  cachedIso = new Date(fixedEpochSeconds() * 1000).toISOString();
+  return cachedIso;
 }
 
 export interface Label {
@@ -47,6 +69,9 @@ export interface Issue {
   labels: Label[];
   seq: number;
   comments: Comment[];
+  /** Bumped on every mutation of this issue; app.ts caches the serialized
+   *  issue JSON per (repo, number, rev) and invalidates on a rev change. */
+  rev: number;
 }
 
 export interface Comment {
@@ -338,6 +363,7 @@ export class Store {
       labels,
       seq: repo.nextNumber,
       comments: [],
+      rev: 0,
     };
     this.nextIssueId += 1;
     repo.nextNumber += 1;

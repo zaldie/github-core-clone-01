@@ -824,6 +824,7 @@ export class GraphQLExecutor {
         return { __typename: 'CloseIssuePayload', issue: null };
       }
       found.issue.state = 'closed';
+      found.issue.rev += 1; // invalidate the cached REST serialization
       return { __typename: 'CloseIssuePayload', issue: this.issueNode(found.repo, found.issue) };
     }
     if (field === 'createPullRequest') {
@@ -884,6 +885,7 @@ export class GraphQLExecutor {
       const comment = { id: found.repo.nextCommentId, body: String(input['body'] ?? '') };
       found.repo.nextCommentId += 1;
       found.issue.comments.push(comment);
+      found.issue.rev += 1; // invalidate the cached REST serialization
       const edge = {
         __typename: 'IssueCommentEdge',
         node: { __typename: 'IssueComment', repo: found.repo, issue: found.issue, comment },
